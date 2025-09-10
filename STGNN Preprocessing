@@ -1,0 +1,359 @@
+name: STGNN Preprocessing GRM to GNN MK 1
+description: Preprocess Data Loader output (JSON/CSV/dir) into STGNN-ready sequences; writes train/val/test arrays, scaler, and metadata.
+
+inputs:
+  - {name: Raw Data, type: Data, description: "Connect the Data Loader's 'Raw Data' output (JSON). A CSV or a directory with processed_data.csv/raw_data.json also works."}
+
+outputs:
+  - {name: X_train_npy, type: Data, description: "NumPy array of training sequences"}
+  - {name: X_val_npy, type: Data, description: "NumPy array of validation sequences"}
+  - {name: X_test_npy, type: Data, description: "NumPy array of test sequences"}
+  - {name: y_train_npy, type: Data, description: "NumPy array of training targets"}
+  - {name: y_val_npy, type: Data, description: "NumPy array of validation targets"}
+  - {name: y_test_npy, type: Data, description: "NumPy array of test targets"}
+  - {name: scaler_pkl, type: Data, description: "Pickled StandardScaler"}
+  - {name: preprocessing_metadata_json, type: Data, description: "Metadata about preprocessing run"}
+  - {name: preprocessing_config_json, type: Data, description: "Effective preprocessing configuration"}
+  - {name: preprocessing_summary_json, type: Data, description: "Summary of preprocessing outputs"}
+
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - bash
+      - -ec
+      - |
+        set -o pipefail
+        export PIP_DISABLE_PIP_VERSION_CHECK=1
+        python3 -m pip install --quiet pandas numpy scikit-learn || python3 -m pip install --quiet --user pandas numpy scikit-learn
+
+        # Write the Python program to disk
+        cat >/tmp/program.py <<'PY'
+        import argparse, os, json, pickle, traceback
+        from datetime import datetime
+        import numpy as np
+        import pandas as pd
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import train_test_split
+
+        DEFAULT_CONFIG = {
+            "sequence_length": 50,
+            "feature_dim": 12,
+            "validation_split": 0.2,
+            "test_split": 0.1,
+            "normalize_features": True,
+            "create_temporal_features": True,
+            "lag_features": [1, 2, 3, 5],
+            "rolling_window": 10,
+            "min_sequence_length": 10
+        }
+
+        def ensure_dir_for(path: str):
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+
+        def convert_to_dataframe(raw_data):
+            rows = []
+            for rec in raw_data:
+                try:
+                    rows.append({
+                        "timestamp": float(rec["timestamp"]),
+                        "value": float(rec["value"]),
+                        "serviceName": rec.get("serviceName", "Unknown"),
+                        "component": rec.get("component", "Unknown"),
+                        "profile": rec.get("profile", "Unknown"),
+                        "metricsName": rec.get("metricsName", "Unknown")
+                    })
+                except (ValueError, KeyError):
+                    continue
+            return pd.DataFrame(rows)
+
+        def load_input(input_path: str) -> pd.DataFrame:
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"Input not found: {input_path}")
+
+            print(f"Input path exists: {input_path}")
+            print(f"Is directory: {os.path.isdir(input_path)}")
+            if os.path.isfile(input_path):
+                print(f"File size: {os.path.getsize(input_path)} bytes")
+
+            # Handle Kubeflow artifact (file without extension)
+            if os.path.isfile(input_path):
+                # Try to determine file type by reading content
+                try:
+                    # First, try reading as JSON
+                    with open(input_path, "r") as f:
+                        content = f.read()
+                        print(f"File content preview: {content[:200]}...")
+                        
+                    # Reset file pointer and try JSON
+                    try:
+                        with open(input_path, "r") as f:
+                            raw = json.load(f)
+                        print(f"Successfully loaded as JSON with {len(raw)} records")
+                        df = convert_to_dataframe(raw)
+                    except json.JSONDecodeError:
+                        # If JSON fails, try CSV
+                        print("JSON parsing failed, trying CSV...")
+                        df = pd.read_csv(input_path)
+                        print(f"Successfully loaded as CSV with {len(df)} rows")
+                except Exception as e:
+                    raise ValueError(f"Could not read file as JSON or CSV: {e}")
+                    
+            elif os.path.isdir(input_path):
+                csv_file = os.path.join(input_path, "processed_data.csv")
+                json_file = os.path.join(input_path, "raw_data.json")
+                data_file = os.path.join(input_path, "data")
+                
+                if os.path.exists(csv_file):
+                    df = pd.read_csv(csv_file)
+                elif os.path.exists(json_file):
+                    with open(json_file, "r") as f:
+                        raw = json.load(f)
+                    df = convert_to_dataframe(raw)
+                elif os.path.exists(data_file):
+                    # Handle Kubeflow data file without extension
+                    try:
+                        with open(data_file, "r") as f:
+                            raw = json.load(f)
+                        df = convert_to_dataframe(raw)
+                    except json.JSONDecodeError:
+                        df = pd.read_csv(data_file)
+                else:
+                    cs = [p for p in os.listdir(input_path) if p.endswith(".csv")]
+                    js = [p for p in os.listdir(input_path) if p.endswith(".json")]
+                    if cs:
+                        df = pd.read_csv(os.path.join(input_path, cs[0]))
+                    elif js:
+                        with open(os.path.join(input_path, js[0]), "r") as f:
+                            raw = json.load(f)
+                        df = convert_to_dataframe(raw)
+                    else:
+                        raise FileNotFoundError("No CSV/JSON found in directory.")
+            else:
+                raise ValueError(f"Input path is neither file nor directory: {input_path}")
+
+            if df.empty:
+                raise ValueError("Loaded dataframe is empty.")
+            return df.sort_values("timestamp").reset_index(drop=True)
+
+        def create_features(df: pd.DataFrame, cfg: dict):
+            feats = []
+            d = df.copy()
+
+            # basic features
+            feats.append(d["value"].values)
+            feats.append(d["timestamp"].values)
+
+            # temporal features
+            if cfg["create_temporal_features"]:
+                d["datetime"] = pd.to_datetime(d["timestamp"], unit="ms")
+                d["hour"] = d["datetime"].dt.hour
+                d["day_of_week"] = d["datetime"].dt.dayofweek
+                d["day_of_month"] = d["datetime"].dt.day
+                d["month"] = d["datetime"].dt.month
+                feats.extend([
+                    d["hour"].values, d["day_of_week"].values,
+                    d["day_of_month"].values, d["month"].values
+                ])
+
+            # rolling stats
+            window = min(cfg["rolling_window"], max(len(d)//10, 1))
+            if window > 0:
+                d["rolling_mean"] = d["value"].rolling(window=window, min_periods=1).mean()
+                d["rolling_std"]  = d["value"].rolling(window=window, min_periods=1).std().fillna(0)
+                d["rolling_min"]  = d["value"].rolling(window=window, min_periods=1).min()
+                d["rolling_max"]  = d["value"].rolling(window=window, min_periods=1).max()
+                feats.extend([
+                    d["rolling_mean"].values, d["rolling_std"].values,
+                    d["rolling_min"].values, d["rolling_max"].values
+                ])
+
+            # lag features
+            for lag in cfg["lag_features"]:
+                if lag < len(d):
+                    lag_feat = d["value"].shift(lag).fillna(d["value"].mean())
+                    feats.append(lag_feat.values)
+
+            X = np.column_stack(feats)
+            fdim = cfg["feature_dim"]
+            if X.shape[1] < fdim:
+                pad = np.zeros((X.shape[0], fdim - X.shape[1]))
+                X = np.column_stack([X, pad])
+            elif X.shape[1] > fdim:
+                X = X[:, :fdim]
+
+            y = d["value"].values
+            return X, y
+
+        def create_sequences(features: np.ndarray, targets: np.ndarray, seq_len: int):
+            seqs, ys = [], []
+            for i in range(seq_len, len(features)):
+                seqs.append(features[i-seq_len:i])
+                ys.append(targets[i])
+            return np.array(seqs), np.array(ys)
+
+        def normalize_sequences(sequences: np.ndarray, apply_norm: bool):
+            scaler = StandardScaler()
+            if not apply_norm:
+                return sequences, scaler
+            orig_shape = sequences.shape
+            flat = sequences.reshape(-1, sequences.shape[-1])
+            scaler.fit(flat)
+            norm = scaler.transform(flat).reshape(orig_shape)
+            return norm, scaler
+
+        def do_split(sequences: np.ndarray, targets: np.ndarray, cfg: dict):
+            test_size = cfg["test_split"]
+            X_temp, X_test, y_temp, y_test = train_test_split(
+                sequences, targets, test_size=test_size, random_state=42, shuffle=False
+            )
+            val_size = cfg["validation_split"] / (1 - test_size) if (1 - test_size) > 0 else 0.0
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_temp, y_temp, test_size=val_size, random_state=42, shuffle=False
+            )
+            return {"X_train": X_train, "X_val": X_val, "X_test": X_test,
+                    "y_train": y_train, "y_val": y_val, "y_test": y_test}
+
+        def main():
+            ap = argparse.ArgumentParser()
+            # inputs
+            ap.add_argument("--raw-data", required=True, type=str)
+
+            # outputs
+            ap.add_argument("--X_train_npy", required=True, type=str)
+            ap.add_argument("--X_val_npy", required=True, type=str)
+            ap.add_argument("--X_test_npy", required=True, type=str)
+            ap.add_argument("--y_train_npy", required=True, type=str)
+            ap.add_argument("--y_val_npy", required=True, type=str)
+            ap.add_argument("--y_test_npy", required=True, type=str)
+            ap.add_argument("--scaler_pkl", required=True, type=str)
+            ap.add_argument("--preprocessing_metadata_json", required=True, type=str)
+            ap.add_argument("--preprocessing_config_json", required=True, type=str)
+            ap.add_argument("--preprocessing_summary_json", required=True, type=str)
+
+            # optional overrides
+            ap.add_argument("--sequence_length", type=int, default=DEFAULT_CONFIG["sequence_length"])
+            ap.add_argument("--feature_dim", type=int, default=DEFAULT_CONFIG["feature_dim"])
+            ap.add_argument("--validation_split", type=float, default=DEFAULT_CONFIG["validation_split"])
+            ap.add_argument("--test_split", type=float, default=DEFAULT_CONFIG["test_split"])
+            ap.add_argument("--normalize_features", type=int, choices=[0,1], default=1)
+            ap.add_argument("--create_temporal_features", type=int, choices=[0,1], default=1)
+            ap.add_argument("--lag_features", type=str, default="1,2,3,5")
+            ap.add_argument("--rolling_window", type=int, default=DEFAULT_CONFIG["rolling_window"])
+
+            args = ap.parse_args()
+
+            cfg = {
+                "sequence_length": args.sequence_length,
+                "feature_dim": args.feature_dim,
+                "validation_split": args.validation_split,
+                "test_split": args.test_split,
+                "normalize_features": bool(args.normalize_features),
+                "create_temporal_features": bool(args.create_temporal_features),
+                "lag_features": [int(x) for x in args.lag_features.split(",")] if args.lag_features else [],
+                "rolling_window": args.rolling_window,
+                "min_sequence_length": DEFAULT_CONFIG["min_sequence_length"]
+            }
+
+            try:
+                print(f"Loading input from: {args.raw_data}")
+                df = load_input(args.raw_data)
+                print(f"Loaded DataFrame with {len(df)} rows")
+                
+                X, y = create_features(df, cfg)
+                print(f"Created features: {X.shape}")
+                
+                seqs, ys = create_sequences(X, y, cfg["sequence_length"])
+                print(f"Created sequences: {seqs.shape}")
+                
+                seqs_norm, scaler = normalize_sequences(seqs, cfg["normalize_features"])
+                splits = do_split(seqs_norm, ys, cfg)
+
+                # ensure dirs for outputs
+                for p in [args.X_train_npy, args.X_val_npy, args.X_test_npy,
+                          args.y_train_npy, args.y_val_npy, args.y_test_npy,
+                          args.scaler_pkl, args.preprocessing_metadata_json,
+                          args.preprocessing_config_json, args.preprocessing_summary_json]:
+                    ensure_dir_for(p)
+
+                # save arrays (remove .npy extension for Kubeflow compatibility)
+                np.save(args.X_train_npy.replace('.npy', ''), splits["X_train"])
+                np.save(args.X_val_npy.replace('.npy', ''), splits["X_val"])
+                np.save(args.X_test_npy.replace('.npy', ''), splits["X_test"])
+                np.save(args.y_train_npy.replace('.npy', ''), splits["y_train"])
+                np.save(args.y_val_npy.replace('.npy', ''), splits["y_val"])
+                np.save(args.y_test_npy.replace('.npy', ''), splits["y_test"])
+
+                # save scaler
+                with open(args.scaler_pkl, "wb") as f:
+                    pickle.dump(scaler, f)
+
+                # save metadata/config/summary
+                metadata = {
+                    "sequence_length": cfg["sequence_length"],
+                    "feature_dim": cfg["feature_dim"],
+                    "total_sequences": int(seqs.shape[0]),
+                    "train_samples": int(len(splits["X_train"])),
+                    "val_samples": int(len(splits["X_val"])),
+                    "test_samples": int(len(splits["X_test"])),
+                    "preprocessing_timestamp": datetime.now().isoformat(),
+                    "normalization_applied": cfg["normalize_features"],
+                    "scaler_type": type(scaler).__name__
+                }
+                with open(args.preprocessing_metadata_json, "w") as f:
+                    json.dump(metadata, f, indent=2)
+
+                with open(args.preprocessing_config_json, "w") as f:
+                    json.dump(cfg, f, indent=2)
+
+                summary = {
+                    "original_data_points": int(len(df)),
+                    "feature_dimension": int(X.shape[1]),
+                    "sequence_length": cfg["sequence_length"],
+                    "total_sequences": int(seqs.shape[0]),
+                    "sequence_shape": list(seqs.shape),
+                    "normalization_applied": cfg["normalize_features"],
+                    "temporal_features_created": cfg["create_temporal_features"],
+                    "lag_features": cfg["lag_features"],
+                    "rolling_window": cfg["rolling_window"]
+                }
+                with open(args.preprocessing_summary_json, "w") as f:
+                    json.dump(summary, f, indent=2)
+
+                print("Preprocessing completed successfully!")
+            except Exception as e:
+                print(f"Error during preprocessing: {e}")
+                traceback.print_exc()
+                raise SystemExit(1)
+
+        if __name__ == "__main__":
+            main()
+        PY
+
+        # Run program with correct argument mapping
+        python3 -u /tmp/program.py \
+          --raw-data "$0" \
+          --X_train_npy "$1" \
+          --X_val_npy "$2" \
+          --X_test_npy "$3" \
+          --y_train_npy "$4" \
+          --y_val_npy "$5" \
+          --y_test_npy "$6" \
+          --scaler_pkl "$7" \
+          --preprocessing_metadata_json "$8" \
+          --preprocessing_config_json "$9" \
+          --preprocessing_summary_json "${10}"
+    args:
+      - {inputPath: Raw Data}
+      - {outputPath: X_train_npy}
+      - {outputPath: X_val_npy}
+      - {outputPath: X_test_npy}
+      - {outputPath: y_train_npy}
+      - {outputPath: y_val_npy}
+      - {outputPath: y_test_npy}
+      - {outputPath: scaler_pkl}
+      - {outputPath: preprocessing_metadata_json}
+      - {outputPath: preprocessing_config_json}
+      - {outputPath: preprocessing_summary_json}
