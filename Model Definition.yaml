@@ -1,0 +1,305 @@
+name: STGNN Model Definition
+description: Defines and initializes STGNN model architecture with configurable parameters for training
+inputs:
+  - {name: preprocessing_metadata_json, type: Data, description: "Preprocessing metadata from brick 2"}
+  - {name: model_name, type: String, default: "STGNN", description: "Name of the model architecture"}
+  - {name: hidden_dim, type: Integer, default: "64", description: "Hidden dimension size"}
+  - {name: num_layers, type: Integer, default: "2", description: "Number of LSTM layers"}
+  - {name: dropout_rate, type: String, default: "0.2", description: "Dropout rate for regularization"}
+  - {name: output_dim, type: Integer, default: "1", description: "Output dimension"}
+outputs:
+  - {name: model_architecture, type: Data, description: "Model architecture definition"}
+  - {name: model_config, type: Data, description: "Complete model configuration"}
+  - {name: model_summary, type: Data, description: "Model summary and parameters"}
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - bash
+      - -ec
+      - |
+        set -o pipefail
+        export PIP_DISABLE_PIP_VERSION_CHECK=1
+        python3 -m pip install --quiet torch torchvision numpy pandas || python3 -m pip install --quiet --user torch torchvision numpy pandas
+        
+        cat >/tmp/program.py <<'PY'
+        import argparse
+        import os
+        import json
+        import traceback
+        from datetime import datetime
+        import torch
+        import torch.nn as nn
+        
+        class STGNNModel(nn.Module):
+            def __init__(self, input_dim, hidden_dim=64, output_dim=1, num_layers=2, dropout=0.2):
+                super(STGNNModel, self).__init__()
+                self.input_dim = input_dim
+                self.hidden_dim = hidden_dim
+                self.num_layers = num_layers
+                self.output_dim = output_dim
+                self.dropout_rate = dropout
+                
+                # Spatial-Temporal layers
+                self.lstm = nn.LSTM(
+                    input_dim, 
+                    hidden_dim, 
+                    num_layers, 
+                    batch_first=True, 
+                    dropout=dropout if num_layers > 1 else 0
+                )
+                
+                # Graph convolution simulation with linear layers
+                self.graph_conv1 = nn.Linear(hidden_dim, hidden_dim)
+                self.graph_conv2 = nn.Linear(hidden_dim, hidden_dim // 2)
+                
+                # Output layer
+                self.output_layer = nn.Linear(hidden_dim // 2, output_dim)
+                
+                # Activation and regularization
+                self.relu = nn.ReLU()
+                self.dropout = nn.Dropout(dropout)
+                self.layer_norm = nn.LayerNorm(hidden_dim)
+                
+            def forward(self, x):
+                batch_size = x.size(0)
+                
+                # LSTM for temporal modeling
+                lstm_out, (hidden, cell) = self.lstm(x)
+                
+                # Use the last output for prediction
+                last_output = lstm_out[:, -1, :]
+                
+                # Apply layer normalization
+                normalized = self.layer_norm(last_output)
+                
+                # Graph convolution layers
+                gc1 = self.relu(self.graph_conv1(normalized))
+                gc1 = self.dropout(gc1)
+                
+                gc2 = self.relu(self.graph_conv2(gc1))
+                gc2 = self.dropout(gc2)
+                
+                # Final prediction
+                output = self.output_layer(gc2)
+                
+                return output
+            
+            def get_model_summary(self):
+                total_params = sum(p.numel() for p in self.parameters())
+                trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+                
+                return {
+                    'total_parameters': int(total_params),
+                    'trainable_parameters': int(trainable_params),
+                    'input_dim': self.input_dim,
+                    'hidden_dim': self.hidden_dim,
+                    'output_dim': self.output_dim,
+                    'num_layers': self.num_layers,
+                    'dropout_rate': self.dropout_rate
+                }
+        
+        def ensure_dir_for(path):
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+        
+        def main():
+            parser = argparse.ArgumentParser()
+            
+            # Input paths
+            parser.add_argument('--preprocessing_metadata_json', required=True)
+            
+            # Model parameters
+            parser.add_argument('--model_name', default='STGNN')
+            parser.add_argument('--hidden_dim', type=int, default=64)
+            parser.add_argument('--num_layers', type=int, default=2)
+            parser.add_argument('--dropout_rate', type=float, default=0.2)
+            parser.add_argument('--output_dim', type=int, default=1)
+            
+            # Output paths
+            parser.add_argument('--model_architecture', required=True)
+            parser.add_argument('--model_config', required=True)
+            parser.add_argument('--model_summary', required=True)
+            
+            args = parser.parse_args()
+            
+            try:
+                print("Loading preprocessing metadata...")
+                
+                # Load preprocessing metadata to get input dimensions
+                with open(args.preprocessing_metadata_json, 'r') as f:
+                    prep_metadata = json.load(f)
+                
+                print(f"Preprocessing metadata type: {type(prep_metadata)}")
+                print(f"Preprocessing metadata content: {prep_metadata}")
+                
+                # Handle both list and dict formats for preprocessing metadata
+                if isinstance(prep_metadata, list):
+                    # If it's a list, look for the first dict with feature_dim
+                    feature_dim = 12  # default
+                    for item in prep_metadata:
+                        if isinstance(item, dict) and 'feature_dim' in item:
+                            feature_dim = item['feature_dim']
+                            break
+                    prep_metadata = prep_metadata[0] if prep_metadata else {}
+                elif isinstance(prep_metadata, dict):
+                    feature_dim = prep_metadata.get('feature_dim', 12)
+                else:
+                    print(f"Warning: Unexpected metadata format, using defaults")
+                    feature_dim = 12
+                    prep_metadata = {}
+                
+                print(f"Creating STGNN model with input_dim: {feature_dim}")
+                
+                # Create model instance
+                model = STGNNModel(
+                    input_dim=feature_dim,
+                    hidden_dim=args.hidden_dim,
+                    output_dim=args.output_dim,
+                    num_layers=args.num_layers,
+                    dropout=args.dropout_rate
+                )
+                
+                # Get model summary
+                model_summary_data = model.get_model_summary()
+                
+                # Prepare model architecture definition
+                model_architecture = {
+                    'model_class': 'STGNNModel',
+                    'architecture_type': 'LSTM-based Spatial-Temporal Graph Neural Network',
+                    'layers': {
+                        'lstm': {
+                            'type': 'LSTM',
+                            'input_size': feature_dim,
+                            'hidden_size': args.hidden_dim,
+                            'num_layers': args.num_layers,
+                            'batch_first': True,
+                            'dropout': args.dropout_rate if args.num_layers > 1 else 0
+                        },
+                        'graph_conv1': {
+                            'type': 'Linear',
+                            'in_features': args.hidden_dim,
+                            'out_features': args.hidden_dim
+                        },
+                        'graph_conv2': {
+                            'type': 'Linear',
+                            'in_features': args.hidden_dim,
+                            'out_features': args.hidden_dim // 2
+                        },
+                        'output_layer': {
+                            'type': 'Linear',
+                            'in_features': args.hidden_dim // 2,
+                            'out_features': args.output_dim
+                        },
+                        'layer_norm': {
+                            'type': 'LayerNorm',
+                            'normalized_shape': args.hidden_dim
+                        }
+                    },
+                    'activation_functions': ['ReLU'],
+                    'regularization': {
+                        'dropout': args.dropout_rate,
+                        'layer_normalization': True
+                    }
+                }
+                
+                # Prepare complete model configuration
+                model_config = {
+                    'model_name': args.model_name,
+                    'input_dim': feature_dim,
+                    'hidden_dim': args.hidden_dim,
+                    'output_dim': args.output_dim,
+                    'num_layers': args.num_layers,
+                    'dropout_rate': args.dropout_rate,
+                    'definition_timestamp': datetime.now().isoformat(),
+                    'preprocessing_metadata': prep_metadata,
+                    'model_ready_for_training': True
+                }
+                
+                # Enhanced model summary
+                enhanced_summary = {
+                    **model_summary_data,
+                    'model_name': args.model_name,
+                    'architecture_description': 'LSTM-based STGNN with graph convolution layers',
+                    'expected_input_shape': f'(batch_size, sequence_length, {feature_dim})',
+                    'expected_output_shape': f'(batch_size, {args.output_dim})',
+                    'memory_estimate_mb': (model_summary_data['total_parameters'] * 4) / (1024 * 1024),  # rough estimate
+                    'definition_timestamp': datetime.now().isoformat()
+                }
+                
+                # Ensure output directories exist
+                for path in [args.model_architecture, args.model_config, args.model_summary]:
+                    ensure_dir_for(path)
+                    print(f"Ensured directory for: {path}")
+                
+                # Save outputs with error handling
+                try:
+                    with open(args.model_architecture, 'w') as f:
+                        json.dump(model_architecture, f, indent=2)
+                    print(f"✓ Saved model architecture to: {args.model_architecture}")
+                except Exception as e:
+                    print(f"Error saving model architecture: {e}")
+                    raise
+                
+                try:
+                    with open(args.model_config, 'w') as f:
+                        json.dump(model_config, f, indent=2)
+                    print(f"✓ Saved model config to: {args.model_config}")
+                except Exception as e:
+                    print(f"Error saving model config: {e}")
+                    raise
+                
+                try:
+                    with open(args.model_summary, 'w') as f:
+                        json.dump(enhanced_summary, f, indent=2)
+                    print(f"✓ Saved model summary to: {args.model_summary}")
+                except Exception as e:
+                    print(f"Error saving model summary: {e}")
+                    raise
+                
+                print("STGNN model definition completed successfully!")
+                print(f"Model has {model_summary_data['total_parameters']} total parameters")
+                
+            except Exception as e:
+                print(f"Error during model definition: {e}")
+                print(f"Error type: {type(e)}")
+                traceback.print_exc()
+                
+                # Try to create empty output files to prevent Kubeflow warnings
+                try:
+                    for path in [args.model_architecture, args.model_config, args.model_summary]:
+                        ensure_dir_for(path)
+                        if not os.path.exists(path):
+                            with open(path, 'w') as f:
+                                json.dump({"error": str(e), "status": "failed"}, f, indent=2)
+                            print(f"Created error placeholder for: {path}")
+                except:
+                    pass
+                
+                raise SystemExit(1)
+        
+        if __name__ == "__main__":
+            main()
+        PY
+        
+        python3 -u /tmp/program.py \
+          --preprocessing_metadata_json "$0" \
+          --model_name "$1" \
+          --hidden_dim "$2" \
+          --num_layers "$3" \
+          --dropout_rate "$4" \
+          --output_dim "$5" \
+          --model_architecture "$6" \
+          --model_config "$7" \
+          --model_summary "$8"
+    args:
+      - {inputPath: preprocessing_metadata_json}
+      - {inputValue: model_name}
+      - {inputValue: hidden_dim}
+      - {inputValue: num_layers}
+      - {inputValue: dropout_rate}
+      - {inputValue: output_dim}
+      - {outputPath: model_architecture}
+      - {outputPath: model_config}
+      - {outputPath: model_summary}
