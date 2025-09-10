@@ -1,0 +1,263 @@
+name: STGNN Data Loader
+description: Generates a 1000-sample STGNN dataset, validates it, computes statistics, and saves raw/processed data with metadata and stats.
+inputs:
+  - {name: Record Count, type: Integer, default: '1000', description: 'Number of records to generate'}
+outputs:
+  - {name: Raw Data, type: Data, description: 'Generated raw dataset in JSON'}
+  - {name: Processed Data, type: Data, description: 'Processed dataset in CSV'}
+  - {name: Metadata, type: Data, description: 'Loader metadata in JSON'}
+  - {name: Statistics, type: Data, description: 'Computed statistics in JSON'}
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - bash
+      - -ec
+      - |
+        set -o pipefail
+        export PIP_DISABLE_PIP_VERSION_CHECK=1
+        python3 -m pip install --quiet pandas numpy || python3 -m pip install --quiet --user pandas numpy
+        
+        # Write the Python program to disk
+        cat >/tmp/program.py <<'PY'
+        import argparse, json, os, random, uuid
+        from datetime import datetime
+        import pandas as pd
+        import numpy as np
+        
+        class STGNNDataLoader:
+            def __init__(self, validation_enabled=True):
+                self.validation_enabled = validation_enabled
+                self.raw_data = []
+        
+            def generate_data(self, count=1000):
+                print('[INFO] Generating STGNN dataset...')
+                data = []
+                base_time = datetime.now()
+                
+                services = ['Mongodb', 'Redis', 'Kafka', 'Elasticsearch']
+                components = ['Db', 'Cache', 'Queue', 'Search']
+                metrics = ['QPS/RPS', 'CPU', 'Memory', 'Latency']
+                profiles = ['max', 'avg', 'min', 'p95']
+                
+                for i in range(count):
+                    timestamp = int((base_time.timestamp() + i * 60) * 1000)
+                    value = round(random.uniform(10.0, 15.0), 6)
+                    
+                    entry = {
+                        'profile': random.choice(profiles),
+                        'serviceName': random.choice(services),
+                        'component': random.choice(components),
+                        'metricsName': random.choice(metrics),
+                        'deploymentId': str(uuid.uuid4()),
+                        'tenantId': '08115c0a-abb3-40d4-914f-3ab4270d624f',
+                        'startTime': str(timestamp - 300000),
+                        'id': str(uuid.uuid4()),
+                        'endTime': str(timestamp),
+                        'applicationId': 'stgnn-app',
+                        'value': str(value),
+                        'timestamp': timestamp,
+                        'namespace': 'default',
+                        'resource': 'compute',
+                        'piMetadata': {
+                            'entityId': str(uuid.uuid4()),
+                            'transactionId': str(uuid.uuid4()),
+                            'creationTimeMS': timestamp + random.randint(1, 1000),
+                            'tenantID': '08115c0a-abb3-40d4-914f-3ab4270d624f'
+                        }
+                    }
+                    data.append(entry)
+                
+                self.raw_data = data
+                return data
+        
+            def validate(self):
+                errors, warnings = [], []
+                required_fields = ['timestamp', 'value', 'serviceName']
+                
+                if not self.raw_data:
+                    errors.append('No data loaded')
+                    return {'status': 'failed', 'errors': errors, 'warnings': warnings}
+                
+                if not isinstance(self.raw_data, list):
+                    errors.append('Data must be a list')
+                    return {'status': 'failed', 'errors': errors, 'warnings': warnings}
+                
+                sample_size = min(100, len(self.raw_data))
+                for i in range(sample_size):
+                    record = self.raw_data[i]
+                    if not isinstance(record, dict):
+                        errors.append(f'Record {i} not dict')
+                        continue
+                    
+                    for field in required_fields:
+                        if field not in record:
+                            errors.append(f'Record {i} missing field {field}')
+                    
+                    if 'timestamp' in record:
+                        try:
+                            float(record['timestamp'])
+                        except Exception:
+                            warnings.append(f'Record {i} invalid timestamp')
+                    
+                    if 'value' in record:
+                        try:
+                            float(record['value'])
+                        except Exception:
+                            warnings.append(f'Record {i} invalid value')
+                
+                status = 'passed' if not errors else 'failed'
+                return {'status': status, 'errors': errors, 'warnings': warnings}
+        
+            def calculate_quality(self):
+                if not self.raw_data:
+                    return 0.0
+                
+                sample_size = min(100, len(self.raw_data))
+                valid_records = 0
+                
+                for record in self.raw_data[:sample_size]:
+                    try:
+                        if isinstance(record, dict):
+                            float(record['timestamp'])
+                            float(record['value'])
+                            valid_records += 1
+                    except:
+                        pass
+                
+                return (valid_records / sample_size) * 100.0
+        
+            def to_dataframe(self):
+                data = []
+                for record in self.raw_data:
+                    try:
+                        data.append({
+                            'timestamp': float(record['timestamp']),
+                            'value': float(record['value']),
+                            'serviceName': record.get('serviceName', 'Unknown'),
+                            'component': record.get('component', 'Unknown'),
+                            'profile': record.get('profile', 'Unknown'),
+                            'metricsName': record.get('metricsName', 'Unknown'),
+                            'id': record.get('id', ''),
+                            'applicationId': record.get('applicationId', 'Unknown')
+                        })
+                    except:
+                        pass
+                
+                if data:
+                    df = pd.DataFrame(data)
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+                    return df
+                else:
+                    return pd.DataFrame()
+        
+        def compute_statistics(raw_data, df):
+            if df.empty:
+                return {
+                    'total_records': len(raw_data),
+                    'valid_records': 0,
+                    'data_completeness': 0,
+                    'value_statistics': {},
+                    'time_range': {},
+                    'service_distribution': {},
+                    'component_distribution': {}
+                }
+            
+            return {
+                'total_records': len(raw_data),
+                'valid_records': len(df),
+                'data_completeness': (len(df) / len(raw_data)) * 100,
+                'value_statistics': {
+                    'count': int(df['value'].count()),
+                    'mean': float(df['value'].mean()),
+                    'std': float(df['value'].std()),
+                    'min': float(df['value'].min()),
+                    'max': float(df['value'].max()),
+                    'median': float(df['value'].median())
+                },
+                'time_range': {
+                    'start': float(df['timestamp'].min()),
+                    'end': float(df['timestamp'].max()),
+                    'duration_hours': float((df['timestamp'].max() - df['timestamp'].min()) / (1000 * 3600))
+                },
+                'service_distribution': df['serviceName'].value_counts().to_dict(),
+                'component_distribution': df['component'].value_counts().to_dict()
+            }
+        
+        def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument('--count', type=int, required=True)
+            ap.add_argument('--raw-out', required=True)
+            ap.add_argument('--processed-out', required=True)
+            ap.add_argument('--metadata-out', required=True)
+            ap.add_argument('--statistics-out', required=True)
+            args = ap.parse_args()
+            
+            print('[INFO] Starting STGNN Data Loader...')
+            loader = STGNNDataLoader()
+            loader.generate_data(args.count)
+            print(f'[INFO] Generated {len(loader.raw_data)} records')
+            
+            validation_result = loader.validate()
+            print(f'[INFO] Validation status: {validation_result["status"]}')
+            
+            metadata = {
+                'source': 'generated',
+                'total_records': len(loader.raw_data),
+                'load_timestamp': datetime.now().isoformat(),
+                'validation_status': validation_result['status'],
+                'data_quality_score': loader.calculate_quality(),
+                'validation_errors': validation_result.get('errors', []),
+                'validation_warnings': validation_result.get('warnings', [])
+            }
+            
+            df = loader.to_dataframe()
+            print(f'[INFO] Converted to DataFrame: {len(df)} rows')
+            
+            stats = compute_statistics(loader.raw_data, df)
+            print('[INFO] Computed statistics')
+            
+            os.makedirs(os.path.dirname(args.raw_out) or '.', exist_ok=True)
+            with open(args.raw_out, 'w') as f:
+                json.dump(loader.raw_data, f, indent=2)
+            print('[SUCCESS] Saved raw data')
+            
+            os.makedirs(os.path.dirname(args.processed_out) or '.', exist_ok=True)
+            if not df.empty:
+                df.to_csv(args.processed_out, index=False)
+                print('[SUCCESS] Saved processed data')
+            else:
+                pd.DataFrame().to_csv(args.processed_out, index=False)
+                print('[WARNING] Saved empty processed data')
+            
+            os.makedirs(os.path.dirname(args.metadata_out) or '.', exist_ok=True)
+            with open(args.metadata_out, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print('[SUCCESS] Saved metadata')
+            
+            os.makedirs(os.path.dirname(args.statistics_out) or '.', exist_ok=True)
+            with open(args.statistics_out, 'w') as f:
+                json.dump(stats, f, indent=2)
+            print('[SUCCESS] Saved statistics')
+            
+            print('[SUCCESS] STGNN Data Loader completed successfully!')
+        
+        if __name__ == '__main__':
+            main()
+        PY
+        
+        # ✅ Correct placeholder mapping for "bash -c":
+        #    $0 -> first arg after the -c string
+        #    $1 -> second, $2 -> third, etc.
+        python3 -u /tmp/program.py \
+          --count "$0" \
+          --raw-out "$1" \
+          --processed-out "$2" \
+          --metadata-out "$3" \
+          --statistics-out "$4"
+    args:
+      - {inputValue: Record Count}
+      - {outputPath: Raw Data}
+      - {outputPath: Processed Data}
+      - {outputPath: Metadata}
+      - {outputPath: Statistics}
